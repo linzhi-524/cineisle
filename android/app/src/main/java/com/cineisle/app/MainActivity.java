@@ -94,12 +94,31 @@ public class MainActivity extends Activity {
         }
     }
 
-        private final HashSet<String> seenDanmakuKeys = new HashSet<>();
-private final Runnable poller = new Runnable() {
+    private static class PendingChat {
+        String id;
+        String who;
+        String text;
+        boolean failed;
+        PendingChat(String id, String who, String text) {
+            this.id = id == null ? "" : id;
+            this.who = who == null ? "观影人" : who;
+            this.text = text == null ? "" : text;
+            this.failed = false;
+        }
+    }
+
+    private final ArrayList<PendingChat> pendingChats = new ArrayList<>();
+    private long lastLocalPlaybackActionAt = 0L;
+    private long lastPlaybackSyncAt = 0L;
+    private int lastObservedPositionMs = 0;
+    private boolean lastObservedPlaying = false;
+
+    private final HashSet<String> seenDanmakuKeys = new HashSet<>();
+    private final Runnable poller = new Runnable() {
         @Override public void run() {
             if (polling && roomId.length() > 0) {
                 fetchRoom();
-                handler.postDelayed(this, 2500);
+                handler.postDelayed(this, 3000);
             }
         }
     };
@@ -837,23 +856,41 @@ private final Runnable poller = new Runnable() {
             if (lastPlaybackIssue.length() > 0) sendPlayback(false);
             return false;
         });
-        video.setOnClickListener(v -> sendPlayback(false));
+        video.setOnClickListener(v -> {
+            lastLocalPlaybackActionAt = System.currentTimeMillis();
+            sendPlayback(true);
+        });
+        video.setOnTouchListener((v, ev) -> {
+            if (ev.getAction() == android.view.MotionEvent.ACTION_UP || ev.getAction() == android.view.MotionEvent.ACTION_DOWN) {
+                lastLocalPlaybackActionAt = System.currentTimeMillis();
+                handler.postDelayed(() -> sendPlayback(true), 450);
+            }
+            return false;
+        });
 
         handler.postDelayed(new Runnable() {
             @Override public void run() {
                 if (!applyingRemote && roomId.length() > 0 && video.getDuration() > 0) {
+                    int pos = outboundPositionMs();
+                    boolean playing = video.isPlaying();
+                    boolean stateChanged = playing != lastObservedPlaying;
+                    boolean movedWhilePlaying = playing && Math.abs(pos - lastObservedPositionMs) > 450;
+                    if (stateChanged || movedWhilePlaying) lastLocalPlaybackActionAt = System.currentTimeMillis();
+                    lastObservedPlaying = playing;
+                    lastObservedPositionMs = pos;
+
                     rememberPlaybackPosition();
-                    int sec = outboundPositionMs() / 1000;
+                    int sec = pos / 1000;
                     updateViewingContext(false);
-                    if (sec != lastSentSecond) {
+                    if (stateChanged || sec != lastSentSecond) {
                         lastSentSecond = sec;
-                        sendPlayback(false);
+                        sendPlayback(stateChanged);
                     }
                     sendCinemaContext(false);
                 }
-                handler.postDelayed(this, 3000);
+                handler.postDelayed(this, 1000);
             }
-        }, 3000);
+        }, 700);
 
         return wrap;
     }
@@ -2036,6 +2073,9 @@ private final Runnable poller = new Runnable() {
 
     private void sendPlayback(boolean force) {
         if (roomId.length() == 0 || serverUrl.length() == 0 || applyingRemote) return;
+        long nowMs = System.currentTimeMillis();
+        if (!force && nowMs - lastPlaybackSyncAt < 2200) return;
+        lastPlaybackSyncAt = nowMs;
         rememberPlaybackPosition();
         int pos = outboundPositionMs();
         boolean paused = video == null || !video.isPlaying();
@@ -2071,7 +2111,9 @@ private final Runnable poller = new Runnable() {
         if (text.length() == 0) return false;
         if (roomId.length() == 0) { toast("先进入房间"); return false; }
         final String out = dm ? "弹幕：" + text : text;
-        appendChat(name, out);
+        final String pendingId = "local-" + System.currentTimeMillis() + "-" + Math.abs(out.hashCode());
+        pendingChats.add(new PendingChat(pendingId, name, out));
+        appendChat(name, out + "（发送中…）");
         if (dm && danmakuOn) showDanmaku(text);
         new Thread(() -> {
             try {
@@ -2080,7 +2122,17 @@ private final Runnable poller = new Runnable() {
                 body.put("assistantName", aiName());
                 body.put("text", out);
                 postJson("/api/rooms/" + roomId + "/message", body, true);
-            } catch(Exception e) { runOnUiThread(() -> toast("发送失败")); }
+                runOnUiThread(() -> {
+                    removePendingChat(pendingId);
+                    fetchRoom();
+                });
+            } catch(Exception e) {
+                runOnUiThread(() -> {
+                    markPendingFailed(pendingId);
+                    renderPendingChats();
+                    toast("发送失败，已先保留在本机");
+                });
+            }
         }).start();
         return true;
     }
@@ -2158,19 +2210,29 @@ private final Runnable poller = new Runnable() {
                 if (remoteSubtitle.length() > 0) contextState.setText("远端字幕：" + remoteSubtitle);
             }
             if (video.getDuration() > 0) {
-                int remoteMs = (int)(t * 1000);
-                if (remoteMs < 1000 && lastStablePositionMs > 5000 && System.currentTimeMillis() - lastStablePositionAt < 15000) {
-                    remoteMs = lastStablePositionMs;
+                String remoteActor = room.optString("lastActor", "");
+                long nowMs = System.currentTimeMillis();
+                boolean recentLocalAction = nowMs - lastLocalPlaybackActionAt < 4200;
+
+                // 避免“刚点播放，房间里旧的 paused=true 又被轮询拉回来”，这是播几秒自动暂停的主要原因。
+                if (remoteActor.equals(name) || recentLocalAction || (remoteActor.length() == 0 && video.isPlaying() && paused)) {
+                    if (video.isPlaying() && paused) sendPlayback(true);
+                } else {
+                    int remoteMs = (int)(t * 1000);
+                    if (remoteMs < 1000 && lastStablePositionMs > 5000 && System.currentTimeMillis() - lastStablePositionAt < 15000) {
+                        remoteMs = lastStablePositionMs;
+                    }
+                    if (Math.abs(video.getCurrentPosition() - remoteMs) > 1800) {
+                        applyingRemote = true;
+                        safeSeekTo(video, remoteMs);
+                        handler.postDelayed(() -> applyingRemote = false, 800);
+                    }
+                    if (!paused && !video.isPlaying()) video.start();
+                    if (paused && video.isPlaying()) video.pause();
                 }
-                if (Math.abs(video.getCurrentPosition() - remoteMs) > 1800) {
-                    applyingRemote = true;
-                    safeSeekTo(video, remoteMs);
-                    handler.postDelayed(() -> applyingRemote = false, 800);
-                }
-                if (!paused && !video.isPlaying()) video.start();
-                if (paused && video.isPlaying()) video.pause();
             }
             chatLog.setText("");
+            if (fullChatLog != null) fullChatLog.setText("");
             JSONArray msgs = room.optJSONArray("messages");
             if (msgs != null) {
                 for (int i = Math.max(0, msgs.length()-30); i < msgs.length(); i++) {
@@ -2188,6 +2250,7 @@ private final Runnable poller = new Runnable() {
                     }
                 }
             }
+            renderPendingChats();
             if (chatLog.getText().length() == 0) chatLog.setText("还没有聊天。第一句可以留给今晚的电影。");
             noteLog.setText("");
             JSONArray notes = room.optJSONArray("notes");
@@ -2243,6 +2306,24 @@ private final Runnable poller = new Runnable() {
         String line;
         while((line = br.readLine()) != null) sb.append(line);
         return sb.toString();
+    }
+
+    private void removePendingChat(String pendingId) {
+        for (int i = pendingChats.size() - 1; i >= 0; i--) {
+            if (pendingChats.get(i).id.equals(pendingId)) pendingChats.remove(i);
+        }
+    }
+
+    private void markPendingFailed(String pendingId) {
+        for (PendingChat p: pendingChats) {
+            if (p.id.equals(pendingId)) p.failed = true;
+        }
+    }
+
+    private void renderPendingChats() {
+        for (PendingChat p: pendingChats) {
+            appendChat(p.who, p.text + (p.failed ? "（本机待同步）" : "（发送中…）"));
+        }
     }
 
     private void appendChat(String who, String text) {

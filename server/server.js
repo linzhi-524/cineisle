@@ -1,16 +1,56 @@
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const app = express();
 const PORT = process.env.PORT || 8787;
 const TOKEN = process.env.CINEISLE_TOKEN || process.env.LINJIAN_CINEMA_TOKEN || "";
-const APP_VERSION = "0.4.4-railway-fixed-signing";
+const APP_VERSION = "0.4.5-playback-chat-persist";
 
 app.use(cors());
 app.use(express.json({ limit: "6mb" }));
 app.use(express.static("public"));
 
 const rooms = new Map();
+const DATA_FILE = process.env.CINEISLE_DATA_FILE || process.env.LINJIAN_CINEMA_DATA_FILE || path.join(process.cwd(), "cineisle-data.json");
+let saveTimer = null;
+
+function scheduleSave() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveRooms, 250);
+}
+
+function saveRooms() {
+  saveTimer = null;
+  try {
+    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+    fs.writeFileSync(DATA_FILE, JSON.stringify({ savedAt: now(), rooms: Array.from(rooms.values()) }, null, 2));
+  } catch (e) {
+    console.warn("[CineIsle] save rooms failed:", e.message);
+  }
+}
+
+function loadRooms() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return;
+    const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    const list = Array.isArray(data.rooms) ? data.rooms : [];
+    for (const r of list) {
+      if (r && r.id) rooms.set(String(r.id).toUpperCase(), {
+        ...r,
+        id: String(r.id).toUpperCase(),
+        messages: Array.isArray(r.messages) ? r.messages.slice(-200) : [],
+        notes: Array.isArray(r.notes) ? r.notes.slice(-200) : [],
+        members: Array.isArray(r.members) ? r.members : [],
+        context: r.context || {}
+      });
+    }
+    console.log(`[CineIsle] loaded ${rooms.size} room(s) from ${DATA_FILE}`);
+  } catch (e) {
+    console.warn("[CineIsle] load rooms failed:", e.message);
+  }
+}
 
 function code() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -47,6 +87,7 @@ function ensure(id) {
   });
   return rooms.get(id);
 }
+loadRooms();
 function publicBaseUrl(req) {
   const envUrl = process.env.CINEISLE_PUBLIC_URL || process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || "";
   if (envUrl) return String(envUrl).replace(/\/+$/, "");
@@ -189,6 +230,7 @@ app.post("/api/rooms",(req,res)=>{
   r.partner = req.body.partner || r.partner;
   r.mood = req.body.mood || r.mood;
   r.inviteNote = req.body.inviteNote || r.inviteNote;
+  r.updatedAt = now(); scheduleSave();
   res.json({ok:true, room: pub(r, req)});
 });
 app.get("/api/rooms/:id",(req,res)=>{
@@ -200,7 +242,7 @@ app.post("/api/rooms/:id/message", auth, (req,res)=>{
   const r = ensure(req.params.id);
   applyAssistantName(r, req.body);
   const m = { id:Date.now()+"", name:req.body.name || "观影人", text:String(req.body.text || "").slice(0,500), at:now() };
-  r.messages.push(m); r.updatedAt = now();
+  r.messages.push(m); r.updatedAt = now(); scheduleSave();
   res.json({ok:true, message:m, room:pub(r, req)});
 });
 app.post("/api/rooms/:id/playback", auth, (req,res)=>{
@@ -219,14 +261,14 @@ app.post("/api/rooms/:id/playback", auth, (req,res)=>{
     r.context = r.context || {};
     r.context.playbackDebug = cleanPlaybackDebug(req.body.playbackDebug);
   }
-  r.updatedAt = now();
+  r.updatedAt = now(); scheduleSave();
   res.json({ok:true, room:pub(r, req)});
 });
 app.post("/api/rooms/:id/note", auth, (req,res)=>{
   const r = ensure(req.params.id);
   applyAssistantName(r, req.body);
   const n = { id:Date.now()+"", name:req.body.name || "观影人", text:String(req.body.text || "").slice(0,800), type:req.body.type || "note", time:req.body.time || r.currentTime, at:now() };
-  r.notes.push(n); r.updatedAt = now();
+  r.notes.push(n); r.updatedAt = now(); scheduleSave();
   res.json({ok:true, note:n, room:pub(r, req)});
 });
 app.post("/api/rooms/:id/card", auth, (req,res)=>{
@@ -247,7 +289,7 @@ app.post("/api/rooms/:id/card", auth, (req,res)=>{
     linNote:req.body.viewerBNote || req.body.linNote || req.body.aiNote || "",
     generatedAt:now()
   };
-  r.updatedAt = now();
+  r.updatedAt = now(); scheduleSave();
   res.json({ok:true, card:r.card, room:pub(r, req)});
 });
 
@@ -273,7 +315,7 @@ app.post("/api/rooms/:id/context", auth, (req,res)=>{
   ctx.subtitleUpdatedAt = now();
   if (req.body.playbackDebug) ctx.playbackDebug = cleanPlaybackDebug(req.body.playbackDebug);
   r.lastActor = ctx.actor;
-  r.updatedAt = now();
+  r.updatedAt = now(); scheduleSave();
   res.json({ok:true, context: compactContext(ctx, false, req, r.id), room: pub(r, req)});
 });
 
@@ -319,7 +361,7 @@ app.post("/api/rooms/:id/screenshot", auth, (req,res)=>{
   ctx.screenshotRequestedAt = null;
   ctx.actor = String(req.body.actor || req.body.name || ctx.actor || "观影人").slice(0,80);
   ctx.observedAt = now();
-  r.updatedAt = now();
+  r.updatedAt = now(); scheduleSave();
   res.json({ok:true, frame: compactContext(ctx, false, req, r.id).latestFrame, ocrText, fallbackText, room: pub(r, req)});
 });
 
@@ -332,7 +374,7 @@ app.post("/api/rooms/:id/screenshot-request", auth, (req,res)=>{
   r.context.frameSource = "request-pending";
   applyAssistantName(r, req.body);
   r.context.actor = req.body.actor || req.body.name || defaultAssistant(r);
-  r.updatedAt = now();
+  r.updatedAt = now(); scheduleSave();
   res.json({ok:true, requestId, requestedAt:r.context.screenshotRequestedAt, room:pub(r, req)});
 });
 app.get("/api/rooms/:id/screenshot-request", auth, (req,res)=>{
@@ -580,6 +622,7 @@ function callCinemaTool(name, args, req) {
     r.partner = args.partner || r.partner;
     r.mood = args.mood || r.mood;
     r.inviteNote = args.inviteNote || r.inviteNote;
+    r.updatedAt = now(); scheduleSave();
     return pub(r, req);
   }
 
@@ -599,7 +642,7 @@ function callCinemaTool(name, args, req) {
       at: now()
     };
     r.messages.push(m);
-    r.updatedAt = now();
+    r.updatedAt = now(); scheduleSave();
     return { message: m, room: pub(r, req) };
   }
 
@@ -612,7 +655,7 @@ function callCinemaTool(name, args, req) {
     if (args.inviteNote) r.inviteNote = String(args.inviteNote).slice(0,240);
     applyAssistantName(r, args);
     r.lastActor = args.actor || defaultAssistant(r);
-    r.updatedAt = now();
+    r.updatedAt = now(); scheduleSave();
     return pub(r, req);
   }
 
@@ -627,7 +670,7 @@ function callCinemaTool(name, args, req) {
       at: now()
     };
     r.notes.push(n);
-    r.updatedAt = now();
+    r.updatedAt = now(); scheduleSave();
     return { note: n, room: pub(r, req) };
   }
 
@@ -640,7 +683,7 @@ function callCinemaTool(name, args, req) {
     r.context.frameSource = "request-pending";
     applyAssistantName(r, args);
     r.context.actor = args.actor || defaultAssistant(r);
-    r.updatedAt = now();
+    r.updatedAt = now(); scheduleSave();
     return { ok:true, requestId, requestedAt:r.context.screenshotRequestedAt, room:pub(r, req) };
   }
 
@@ -697,7 +740,7 @@ function callCinemaTool(name, args, req) {
       linNote: args.viewerBNote || args.linNote || args.aiNote || args.note || "",
       generatedAt: now()
     };
-    r.updatedAt = now();
+    r.updatedAt = now(); scheduleSave();
     return { card: r.card, room: pub(r, req) };
   }
 

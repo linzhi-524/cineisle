@@ -1,7 +1,7 @@
 {
   "name": "cineisle-root",
   "private": true,
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "CineIsle monorepo helper scripts for Railway and local server deployment.",
   "scripts": {
     "railway:build": "cd server && npm install --package-lock=false --no-audit --no-fund && npm run check",
