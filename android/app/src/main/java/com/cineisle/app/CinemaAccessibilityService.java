@@ -57,7 +57,8 @@ public class CinemaAccessibilityService extends AccessibilityService {
         String token = sp.getString("token", "");
         String name = sp.getString("name", "观影人");
         String assistantName = helperName(sp.getString("assistantName", "观影助手"));
-        if (serverUrl.length() == 0 || roomId.length() == 0) return;
+        if (serverUrl.length() == 0) { setStatus("截图等待：后端地址为空"); return; }
+        if (roomId.length() == 0) { setStatus("截图等待：还没有进入房间"); return; }
 
         long localReq = sp.getLong("screenshotRequestId", 0);
         long handledLocalReq = sp.getLong("lastHandledScreenshotRequestId", 0);
@@ -91,12 +92,17 @@ public class CinemaAccessibilityService extends AccessibilityService {
     private boolean checkRemoteRequest(String serverUrl, String roomId, String token, android.content.SharedPreferences sp, String assistantName) {
         try {
             String since = sp.getString("lastRemoteScreenshotRequestId", "");
-            URL url = new URL(serverUrl + "/api/rooms/" + roomId + "/screenshot-request?since=" + since);
+            String qs = "?since=" + java.net.URLEncoder.encode(since, "UTF-8");
+            if (token != null && token.length() > 0) qs += "&token=" + java.net.URLEncoder.encode(token, "UTF-8");
+            URL url = new URL(serverUrl + "/api/rooms/" + roomId + "/screenshot-request" + qs);
             HttpURLConnection c = (HttpURLConnection) url.openConnection();
             c.setRequestMethod("GET");
             c.setConnectTimeout(5000);
             c.setReadTimeout(5000);
-            if (token != null && token.length() > 0) c.setRequestProperty("Authorization", "Bearer " + token);
+            if (token != null && token.length() > 0) {
+            c.setRequestProperty("Authorization", "Bearer " + token);
+            c.setRequestProperty("X-CineIsle-Token", token);
+        }
             int code = c.getResponseCode();
             if (code >= 400) return false;
             String text = readAll(c.getInputStream());
@@ -166,15 +172,21 @@ public class CinemaAccessibilityService extends AccessibilityService {
     }
 
     private void upload(String serverUrl, String roomId, String token, String name, String base64, int width, int height, String source) throws Exception {
-        URL url = new URL(serverUrl + "/api/rooms/" + roomId + "/screenshot");
+        String upPath = "/api/rooms/" + roomId + "/screenshot";
+        if (token != null && token.length() > 0) upPath += "?token=" + java.net.URLEncoder.encode(token, "UTF-8");
+        URL url = new URL(serverUrl + upPath);
         HttpURLConnection c = (HttpURLConnection) url.openConnection();
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setConnectTimeout(10000);
         c.setReadTimeout(10000);
         c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-        if (token != null && token.length() > 0) c.setRequestProperty("Authorization", "Bearer " + token);
+        if (token != null && token.length() > 0) {
+            c.setRequestProperty("Authorization", "Bearer " + token);
+            c.setRequestProperty("X-CineIsle-Token", token);
+        }
         JSONObject body = new JSONObject();
+        if (token != null && token.length() > 0) body.put("token", token);
         body.put("actor", name);
         body.put("mime", "image/jpeg");
         body.put("imageBase64", base64);
@@ -186,7 +198,11 @@ public class CinemaAccessibilityService extends AccessibilityService {
             os.write(body.toString().getBytes("UTF-8"));
         }
         int code = c.getResponseCode();
-        if (code >= 400) throw new RuntimeException("HTTP " + code);
+        if (code >= 400) {
+            InputStream es = c.getErrorStream();
+            String err = es == null ? "" : readAll(es);
+            throw new RuntimeException("HTTP " + code + (err.length() > 0 ? (" " + err) : ""));
+        }
         setStatus("截图已上传：" + width + "×" + height + "，HTTP " + code);
     }
 

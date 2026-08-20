@@ -69,6 +69,7 @@ public class MainActivity extends Activity {
     private boolean fullscreenExitWasPlaying = false;
     private long fullscreenExitAt = 0L;
     private String lastPlaybackIssue = "";
+    private String lastNetworkIssue = "";
     private final ArrayList<SubtitleCue> subtitleCues = new ArrayList<>();
     private final ArrayList<MovieItem> movieLibrary = new ArrayList<>();
 
@@ -110,6 +111,7 @@ public class MainActivity extends Activity {
     private final ArrayList<PendingChat> pendingChats = new ArrayList<>();
     private long lastLocalPlaybackActionAt = 0L;
     private long lastPlaybackSyncAt = 0L;
+    private String lastAppliedPlaybackCommandId = "";
     private int lastObservedPositionMs = 0;
     private boolean lastObservedPlaying = false;
 
@@ -702,6 +704,8 @@ public class MainActivity extends Activity {
         overlay.addView(empty);
         add(overlay, hint, -1, -2, 8);
         videoFrame.addView(overlay, new FrameLayout.LayoutParams(-1, -1));
+        overlay.setOnClickListener(v -> togglePlay());
+        videoFrame.setOnClickListener(v -> togglePlay());
         FrameLayout.LayoutParams subLp = new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
         subLp.setMargins(dp(16), 0, dp(16), dp(18));
         videoFrame.addView(subtitleOverlay, subLp);
@@ -712,17 +716,22 @@ public class MainActivity extends Activity {
 
         LinearLayout actions = hbox();
         Button pick = btn("导入影片", true);
+        Button playPause = btn("播放/暂停", true);
+        actions.addView(pick, new LinearLayout.LayoutParams(0, dp(46), 1));
+        LinearLayout.LayoutParams ppLp = new LinearLayout.LayoutParams(0, dp(46), 1); ppLp.setMargins(dp(8),0,0,0);
+        actions.addView(playPause, ppLp);
+        add(c, actions, -1, 46, 8);
+
+        LinearLayout actions2 = hbox();
         Button sync = btn("同步进度", false);
         Button danmaku = btn("弹幕 ON", false);
         Button fullscreen = btn("横屏", false);
-        actions.addView(pick, new LinearLayout.LayoutParams(0, dp(46), 1));
-        LinearLayout.LayoutParams ax = new LinearLayout.LayoutParams(0, dp(46), 1); ax.setMargins(dp(8),0,0,0);
-        actions.addView(sync, ax);
+        actions2.addView(sync, new LinearLayout.LayoutParams(0, dp(46), 1));
         LinearLayout.LayoutParams dx = new LinearLayout.LayoutParams(0, dp(46), 1); dx.setMargins(dp(8),0,0,0);
-        actions.addView(danmaku, dx);
+        actions2.addView(danmaku, dx);
         LinearLayout.LayoutParams fx = new LinearLayout.LayoutParams(0, dp(46), 1); fx.setMargins(dp(8),0,0,0);
-        actions.addView(fullscreen, fx);
-        add(c, actions, -1, 46, 12);
+        actions2.addView(fullscreen, fx);
+        add(c, actions2, -1, 46, 12);
 
         LinearLayout senseP = panel();
         senseP.addView(tv(aiName() + "感知", 18, Typeface.BOLD));
@@ -795,6 +804,7 @@ public class MainActivity extends Activity {
         add(c, noteP, -1, -2, 14);
 
         pick.setOnClickListener(v -> pickVideo());
+        playPause.setOnClickListener(v -> togglePlay());
         sync.setOnClickListener(v -> sendPlayback(true));
         danmaku.setOnClickListener(v -> { danmakuOn = !danmakuOn; danmaku.setText(danmakuOn ? "弹幕 ON" : "弹幕 OFF"); });
         fullscreen.setOnClickListener(v -> openCinemaFullscreen());
@@ -856,10 +866,7 @@ public class MainActivity extends Activity {
             if (lastPlaybackIssue.length() > 0) sendPlayback(false);
             return false;
         });
-        video.setOnClickListener(v -> {
-            lastLocalPlaybackActionAt = System.currentTimeMillis();
-            sendPlayback(true);
-        });
+        video.setOnClickListener(v -> togglePlay());
         video.setOnTouchListener((v, ev) -> {
             if (ev.getAction() == android.view.MotionEvent.ACTION_UP || ev.getAction() == android.view.MotionEvent.ACTION_DOWN) {
                 lastLocalPlaybackActionAt = System.currentTimeMillis();
@@ -1589,6 +1596,8 @@ public class MainActivity extends Activity {
     }
 
     private void requestLocalScreenshotNow() {
+        if (serverUrl.length() == 0) { toast("先在设置里填写后端地址"); return; }
+        if (roomId.length() == 0) { toast("先创建或进入房间，截图才知道上传到哪里"); return; }
         autoScreenshot = true;
         savePrefs();
         long requestId = System.currentTimeMillis();
@@ -1602,6 +1611,29 @@ public class MainActivity extends Activity {
         toast("已请求" + aiName() + "看一眼，请停留在想给它看的画面");
     }
 
+
+    private void togglePlay() {
+        if (video == null) return;
+        try {
+            if (fileName.length() == 0 && currentMovieUri.length() == 0) {
+                toast("先导入影片");
+                return;
+            }
+            lastLocalPlaybackActionAt = System.currentTimeMillis();
+            applyingRemote = false;
+            if (video.isPlaying()) {
+                video.pause();
+                toast("已暂停");
+            } else {
+                video.start();
+                toast("开始播放");
+            }
+            updateViewingContext(false);
+            handler.postDelayed(() -> sendPlayback(true), 250);
+        } catch(Exception e) {
+            toast("播放控制失败：" + e.getClass().getSimpleName());
+        }
+    }
 
     private void rememberPlaybackPosition() {
         try {
@@ -2130,7 +2162,7 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     markPendingFailed(pendingId);
                     renderPendingChats();
-                    toast("发送失败，已先保留在本机");
+                    toast("发送失败：" + e.getMessage());
                 });
             }
         }).start();
@@ -2182,6 +2214,53 @@ public class MainActivity extends Activity {
         }).start();
     }
 
+
+    private boolean applyRemotePlaybackCommand(JSONObject ctx) {
+        if (ctx == null) return false;
+        JSONObject cmd = ctx.optJSONObject("playbackCommand");
+        if (cmd == null) return false;
+        String id = cmd.optString("id", "");
+        if (id.length() == 0 || id.equals(lastAppliedPlaybackCommandId)) return false;
+
+        String action = cmd.optString("action", "").toLowerCase(java.util.Locale.US);
+        boolean hasPaused = cmd.has("paused");
+        boolean paused = cmd.optBoolean("paused", action.equals("pause"));
+        double sec = cmd.has("currentTime") ? cmd.optDouble("currentTime", -1) : -1;
+        int targetMs = sec >= 0 ? (int)Math.max(0, sec * 1000) : -1;
+        String actor = cmd.optString("actor", aiName());
+
+        if (video == null || video.getDuration() <= 0) {
+            syncState.setText("远程播放命令已收到，但本机还没导入/准备好影片 · " + actor);
+            lastPlaybackIssue = "remote command waiting: video not ready, action=" + action;
+            return false;
+        }
+
+        try {
+            applyingRemote = true;
+            lastAppliedPlaybackCommandId = id;
+            lastLocalPlaybackActionAt = System.currentTimeMillis();
+            if (targetMs >= 0) safeSeekTo(video, targetMs);
+            if (action.equals("play") || (hasPaused && !paused)) {
+                if (!video.isPlaying()) video.start();
+                syncState.setText("已执行远程播放 · " + actor);
+            } else if (action.equals("pause") || (hasPaused && paused)) {
+                if (video.isPlaying()) video.pause();
+                syncState.setText("已执行远程暂停 · " + actor);
+            } else if (action.equals("seek")) {
+                syncState.setText("已执行远程跳转 · " + actor);
+            }
+            handler.postDelayed(() -> applyingRemote = false, 900);
+            handler.postDelayed(() -> sendPlayback(true), 350);
+            return true;
+        } catch (Exception e) {
+            applyingRemote = false;
+            lastPlaybackIssue = "remote command failed: " + e.getClass().getSimpleName() + " " + e.getMessage();
+            syncState.setText("远程播放命令失败：" + e.getClass().getSimpleName());
+            sendPlayback(false);
+            return false;
+        }
+    }
+
     private void applyRoom(JSONObject room) {
         try {
             roomCodeView.setText("房间号 " + room.optString("id", roomId));
@@ -2209,7 +2288,8 @@ public class MainActivity extends Activity {
                 String remoteSubtitle = ctx.optString("currentSubtitle", "");
                 if (remoteSubtitle.length() > 0) contextState.setText("远端字幕：" + remoteSubtitle);
             }
-            if (video.getDuration() > 0) {
+            boolean handledRemoteCommand = applyRemotePlaybackCommand(ctx);
+            if (!handledRemoteCommand && video.getDuration() > 0) {
                 String remoteActor = room.optString("lastActor", "");
                 long nowMs = System.currentTimeMillis();
                 boolean recentLocalAction = nowMs - lastLocalPlaybackActionAt < 4200;
@@ -2273,25 +2353,38 @@ public class MainActivity extends Activity {
         } catch(Exception ignored) {}
     }
 
+    private URL apiUrl(String path, boolean auth) throws Exception {
+        String base = normalizeServer(serverUrl);
+        if (base.length() == 0) throw new IOException("后端地址为空");
+        String p = path.startsWith("/") ? path : ("/" + path);
+        if (auth && token.length() > 0 && p.indexOf("token=") < 0) {
+            p += (p.indexOf('?') >= 0 ? "&" : "?") + "token=" + URLEncoder.encode(token, "UTF-8");
+        }
+        return new URL(base + p);
+    }
+
     private JSONObject getJson(String path) throws Exception {
-        URL url = new URL(serverUrl + path);
-        HttpURLConnection c = (HttpURLConnection) url.openConnection();
+        HttpURLConnection c = (HttpURLConnection) apiUrl(path, false).openConnection();
         c.setRequestMethod("GET");
-        c.setConnectTimeout(8000);
-        c.setReadTimeout(8000);
+        c.setConnectTimeout(10000);
+        c.setReadTimeout(10000);
         String s = read(c);
         return new JSONObject(s);
     }
 
     private JSONObject postJson(String path, JSONObject body, boolean auth) throws Exception {
-        URL url = new URL(serverUrl + path);
-        HttpURLConnection c = (HttpURLConnection) url.openConnection();
+        if (body == null) body = new JSONObject();
+        HttpURLConnection c = (HttpURLConnection) apiUrl(path, auth).openConnection();
         c.setRequestMethod("POST");
         c.setDoOutput(true);
-        c.setConnectTimeout(8000);
-        c.setReadTimeout(8000);
+        c.setConnectTimeout(10000);
+        c.setReadTimeout(10000);
         c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-        if (auth && token.length() > 0) c.setRequestProperty("Authorization", "Bearer " + token);
+        if (auth && token.length() > 0) {
+            c.setRequestProperty("Authorization", "Bearer " + token);
+            c.setRequestProperty("X-CineIsle-Token", token);
+            body.put("token", token);
+        }
         try(OutputStream os = c.getOutputStream()) {
             os.write(body.toString().getBytes("UTF-8"));
         }
@@ -2300,12 +2393,19 @@ public class MainActivity extends Activity {
     }
 
     private String read(HttpURLConnection c) throws Exception {
-        InputStream is = c.getResponseCode() >= 400 ? c.getErrorStream() : c.getInputStream();
-        BufferedReader br = new BufferedReader(new InputStreamReader(is, "UTF-8"));
+        int code = c.getResponseCode();
+        InputStream raw = code >= 400 ? c.getErrorStream() : c.getInputStream();
+        if (raw == null) throw new IOException("HTTP " + code + " 无响应内容");
+        BufferedReader br = new BufferedReader(new InputStreamReader(raw, "UTF-8"));
         StringBuilder sb = new StringBuilder();
         String line;
         while((line = br.readLine()) != null) sb.append(line);
-        return sb.toString();
+        String text = sb.toString();
+        if (code >= 400) {
+            lastNetworkIssue = "HTTP " + code + " " + text;
+            throw new IOException(lastNetworkIssue.length() > 180 ? lastNetworkIssue.substring(0,180) : lastNetworkIssue);
+        }
+        return text;
     }
 
     private void removePendingChat(String pendingId) {

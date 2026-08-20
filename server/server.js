@@ -6,7 +6,7 @@ const path = require("path");
 const app = express();
 const PORT = process.env.PORT || 8787;
 const TOKEN = process.env.CINEISLE_TOKEN || process.env.LINJIAN_CINEMA_TOKEN || "";
-const APP_VERSION = "0.4.5-playback-chat-persist";
+const APP_VERSION = "0.4.7-mcp-playback-command-fix";
 
 app.use(cors());
 app.use(express.json({ limit: "6mb" }));
@@ -190,6 +190,8 @@ function compactContext(ctx, includeFrameData, req, roomId) {
     screenshotRequestId: ctx.screenshotRequestId || null,
     screenshotRequestedAt: ctx.screenshotRequestedAt || null,
     playbackDebug: ctx.playbackDebug || { events: [], range: null, lastError: "", updatedAt: null },
+    playbackCommand: ctx.playbackCommand || null,
+    playbackCommandAck: ctx.playbackCommandAck || null,
     recentFrames,
     latestFrame
   };
@@ -484,6 +486,46 @@ function mcpTools() {
       }
     },
     {
+      name: "play_movie",
+      description: "让进入该房间的手机端开始播放本地已导入的影片；比 control_playback(paused:false) 更明确，会下发一次播放命令",
+      inputSchema: {
+        type: "object",
+        properties: {
+          room: { type: "string", description: "房间号" },
+          currentTime: { type: "number", description: "可选：开始播放的位置，单位秒" },
+          actor: { type: "string", description: "操作者" }
+        },
+        required: ["room"]
+      }
+    },
+    {
+      name: "pause_movie",
+      description: "让进入该房间的手机端暂停播放；会下发一次暂停命令",
+      inputSchema: {
+        type: "object",
+        properties: {
+          room: { type: "string", description: "房间号" },
+          currentTime: { type: "number", description: "可选：暂停位置，单位秒" },
+          actor: { type: "string", description: "操作者" }
+        },
+        required: ["room"]
+      }
+    },
+    {
+      name: "seek_movie",
+      description: "让进入该房间的手机端跳转到指定时间；可选择跳转后播放或暂停",
+      inputSchema: {
+        type: "object",
+        properties: {
+          room: { type: "string", description: "房间号" },
+          currentTime: { type: "number", description: "目标播放位置，单位秒" },
+          paused: { type: "boolean", description: "跳转后是否暂停；不填时保持当前状态" },
+          actor: { type: "string", description: "操作者" }
+        },
+        required: ["room", "currentTime"]
+      }
+    },
+    {
       name: "add_note",
       description: "给观影房间添加一条观影笔记",
       inputSchema: {
@@ -593,6 +635,32 @@ function imagePartFromResult(obj) {
   } catch (e) { return null; }
 }
 
+
+function setPlaybackCommand(r, args, action) {
+  args = args || {};
+  const ctx = r.context || (r.context = {});
+  const id = Date.now() + "-" + Math.random().toString(16).slice(2, 8);
+  const paused = typeof args.paused === "boolean" ? args.paused : (action === "pause" ? true : (action === "play" ? false : r.paused));
+  const currentTime = typeof args.currentTime === "number" ? Math.max(0, args.currentTime) : (typeof args.time === "number" ? Math.max(0, args.time) : r.currentTime);
+  const cmdAction = action || (paused ? "pause" : "play");
+  ctx.playbackCommand = {
+    id,
+    action: cmdAction,
+    paused,
+    currentTime,
+    actor: args.actor || defaultAssistant(r),
+    force: args.force !== false,
+    createdAt: now()
+  };
+  ctx.playbackCommandAck = null;
+  r.currentTime = currentTime;
+  r.paused = paused;
+  r.lastActor = ctx.playbackCommand.actor;
+  r.updatedAt = now();
+  scheduleSave();
+  return ctx.playbackCommand;
+}
+
 function mcpText(obj) {
   return {
     content: [
@@ -648,15 +716,23 @@ function callCinemaTool(name, args, req) {
 
   if (name === "control_playback") {
     const r = ensure(args.room || args.room_id);
-    if (typeof args.currentTime === "number") r.currentTime = Math.max(0, args.currentTime);
-    if (typeof args.paused === "boolean") r.paused = args.paused;
     if (args.partner) r.partner = String(args.partner).slice(0,80);
     if (args.mood) r.mood = String(args.mood).slice(0,80);
     if (args.inviteNote) r.inviteNote = String(args.inviteNote).slice(0,240);
     applyAssistantName(r, args);
-    r.lastActor = args.actor || defaultAssistant(r);
-    r.updatedAt = now(); scheduleSave();
-    return pub(r, req);
+    const cmd = (typeof args.paused === "boolean" || typeof args.currentTime === "number")
+      ? setPlaybackCommand(r, args, typeof args.paused === "boolean" ? (args.paused ? "pause" : "play") : "seek")
+      : null;
+    return { ok:true, command: cmd, room: pub(r, req), note: cmd ? "已下发远程播放命令，手机端下一次轮询会执行。" : "未提供 paused/currentTime，仅返回房间状态。" };
+  }
+
+  if (name === "play_movie" || name === "pause_movie" || name === "seek_movie") {
+    const r = ensure(args.room || args.room_id);
+    applyAssistantName(r, args);
+    if (name === "play_movie") args.paused = false;
+    if (name === "pause_movie") args.paused = true;
+    const cmd = setPlaybackCommand(r, args, name === "play_movie" ? "play" : (name === "pause_movie" ? "pause" : "seek"));
+    return { ok:true, command: cmd, room: pub(r, req), note: "已下发远程播放命令，手机端下一次轮询会执行；若本机未导入影片，手机端会显示等待本机导入。" };
   }
 
   if (name === "add_note") {
@@ -792,7 +868,7 @@ function handleMcpMessage(req, msg) {
   }
 
   // 兼容旧写法：直接 method=create_room / send_room_message
-  if (["create_room", "get_room_state", "send_room_message", "control_playback", "add_note", "generate_card", "get_viewing_context", "request_screenshot", "get_screenshot_text", "get_playback_debug"].includes(method)) {
+  if (["create_room", "get_room_state", "send_room_message", "control_playback", "play_movie", "pause_movie", "seek_movie", "add_note", "generate_card", "get_viewing_context", "request_screenshot", "get_screenshot_text", "get_playback_debug"].includes(method)) {
     if (!isAuthed(req)) return rpcError(id || 1, -32001, "CINEISLE_BAD_TOKEN");
     try {
       const result = callCinemaTool(method, args, req);
